@@ -5,8 +5,10 @@ const TOKEN = process.env.ROBO_DAS_TOKEN;
 const PGMEI = "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao";
 if (!TOKEN) throw new Error("Defina ROBO_DAS_TOKEN");
 
+const PORT = Number(process.env.PORT) || 3000;
+
 let browser;
-const getBrowser = async () => (browser ??= await chromium.launch({ headless: true }));
+const getBrowser = async () => (browser ??= await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] }));
 
 async function emitir({ cnpj, ano, mes }) {
   const ctx = await (await getBrowser()).newContext({ acceptDownloads: true, locale: "pt-BR" });
@@ -44,9 +46,9 @@ async function emitir({ cnpj, ano, mes }) {
   }
 }
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   const send = (s, b) => { res.writeHead(s, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
-  if (req.url === "/health") return send(200, { ok: true });
+  if (req.url === "/health") return send(200, { ok: true, status: "online" });
   if (req.method !== "POST" || req.url !== "/emitir") return send(404, { ok: false });
   if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { ok: false, erro: "Não autorizado" });
   let body = "";
@@ -55,4 +57,8 @@ http.createServer(async (req, res) => {
   if (!/^\d{14}$/.test(cnpj ?? "") || !/^\d{4}$/.test(ano ?? "") || !/^\d{2}$/.test(mes ?? ""))
     return send(400, { ok: false, erro: "Dados inválidos" });
   send(200, await emitir({ cnpj, ano, mes }));
-}).listen(process.env.PORT || 3000);
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Robô do DAS ouvindo em 0.0.0.0:${PORT}`);
+});
