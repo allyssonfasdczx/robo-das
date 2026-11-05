@@ -1,0 +1,7 @@
+{
+  "name": "robo-das",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": { "playwright": "1.48.2" }
+}
