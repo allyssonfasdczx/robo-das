@@ -1,7 +1,5 @@
 import http from "node:http";
 import https from "node:https";
-import tls from "node:tls";
-import crypto from "node:crypto";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -25,45 +23,12 @@ if (SERPRO_CERT_B64) {
       pfx: pfxBuffer,
       passphrase: SERPRO_CERT_PASS || "",
       rejectUnauthorized: true,
+      keepAlive: true,
     });
     console.log("[serpro] Agente mTLS com certificado e-CNPJ configurado.");
   } catch (err) {
     console.error("[serpro] Falha ao carregar certificado mTLS:", err.message);
   }
-}
-
-let serproTokenCache = { token: null, expiraEm: 0 };
-
-async function obterTokenSerpro() {
-  if (!SERPRO_KEY || !SERPRO_SECRET) {
-    throw new Error("Credenciais do SERPRO não configuradas.");
-  }
-  const agora = Date.now();
-  if (serproTokenCache.token && serproTokenCache.expiraEm > agora + 60_000) {
-    return serproTokenCache.token;
-  }
-  const basic = Buffer.from(`${SERPRO_KEY}:${SERPRO_SECRET}`).toString("base64");
-  const corpo = new URLSearchParams({ grant_type: "client_credentials" }).toString();
-
-  const res = await fetch("https://gateway.apiserpro.serpro.gov.br/token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: corpo,
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Falha OAuth SERPRO (${res.status}): ${txt}`);
-  }
-  const data = await res.json();
-  serproTokenCache = {
-    token: data.access_token,
-    expiraEm: agora + (Number(data.expires_in) || 3600) * 1000,
-  };
-  return serproTokenCache.token;
 }
 
 function requestHttpsComAgente(urlStr, options, bodyData) {
@@ -85,236 +50,54 @@ function requestHttpsComAgente(urlStr, options, bodyData) {
       }
     );
     req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("Timeout na requisição SERPRO")));
     if (bodyData) req.write(bodyData);
     req.end();
   });
 }
 
-async function emitirDasViaSerpro({ cnpj, ano, mes }) {
-  if (!SERPRO_KEY || !serproHttpsAgent) {
-    return null;
+let tokenCache = null;
+
+async function obterTokenSerpro() {
+  if (!SERPRO_KEY || !SERPRO_SECRET || !serproHttpsAgent) {
+    throw new Error("Credenciais ou certificado mTLS do SERPRO não configurados.");
   }
-  const token = await obterTokenSerpro();
-  const cnpjContribuinte = String(cnpj).replace(/\D/g, "");
-  const cnpjContratante = SERPRO_CNPJ || cnpjContribuinte;
-  const mesFormatado = String(mes).padStart(2, "0");
-  const periodoApuracao = `${ano}${mesFormatado}`;
+  const agora = Date.now();
+  if (tokenCache && tokenCache.expiraEm > agora + 60_000) {
+    return tokenCache;
+  }
 
-  const envelope = {
-    contratante: { numero: cnpjContratante, tipo: 2 },
-    autorPedidoDados: { numero: cnpjContratante, tipo: 2 },
-    contribuinte: { numero: cnpjContribuinte, tipo: 2 },
-    pedidoDados: {
-      idSistema: "PGMEI",
-      idServico: "GERARDASPDF21",
-      versaoSistema: "1.0",
-      dados: JSON.stringify({
-        periodoApuracao,
-      }),
-    },
-  };
+  const basic = Buffer.from(`${SERPRO_KEY}:${SERPRO_SECRET}`).toString("base64");
+  const corpo = "grant_type=client_credentials";
 
-  const payload = JSON.stringify(envelope);
-
-  // Tenta endpoint /Emitir (padrão de serviços GERAR...), e caso necessário /Consultar
-  let resposta = await requestHttpsComAgente(
-    "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Emitir",
+  // Autenticação oficial mTLS SERPRO Integra Contador (gera access_token e jwt_token)
+  const res = await requestHttpsComAgente(
+    "https://autenticacao.sapi.serpro.gov.br/authenticate",
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "Content-Length": Buffer.byteLength(payload),
+        Authorization: `Basic ${basic}`,
+        "Role-Type": "TERCEIROS",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(corpo),
       },
     },
-    payload
+    corpo
   );
 
-  if (resposta.status === 404 || resposta.status === 405) {
-    resposta = await requestHttpsComAgente(
-      "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      },
-      payload
-    );
+  const txt = res.body.toString("utf8");
+  if (res.status !== 200) {
+    console.error("[serpro auth]", res.status, txt);
+    throw new Error(`Falha autenticação SERPRO (${res.status}): ${txt.slice(0, 300)}`);
   }
 
-  const rawTxt = resposta.body.toString("utf8");
-  console.log(`[serpro] HTTP ${resposta.status}:`, rawTxt.slice(0, 500));
-
-  if (resposta.status < 200 || resposta.status >= 300) {
-    throw new Error(`SERPRO HTTP ${resposta.status}: ${rawTxt.slice(0, 300)}`);
-  }
-
-  const json = JSON.parse(rawTxt);
-  let dadosRetorno = json?.respostaDados?.dados || json?.dados;
-  if (typeof dadosRetorno === "string") {
-    try {
-      dadosRetorno = JSON.parse(dadosRetorno);
-    } catch {}
-  }
-
-  const pdfBase64 =
-    dadosRetorno?.pdf ||
-    dadosRetorno?.documentoPdf ||
-    dadosRetorno?.arquivoPdf ||
-    (Array.isArray(dadosRetorno) && dadosRetorno[0]?.pdf) ||
-    json?.pdf;
-
-  const codigoBarras =
-    dadosRetorno?.codigoBarras ||
-    dadosRetorno?.linhaDigitavel ||
-    dadosRetorno?.numeroCodigoBarras ||
-    (Array.isArray(dadosRetorno) && dadosRetorno[0]?.codigoBarras) ||
-    null;
-
-  if (!pdfBase64) {
-    const msg =
-      json?.mensagens?.map((m) => m.texto).join("; ") ||
-      dadosRetorno?.mensagens?.[0]?.texto ||
-      dadosRetorno?.mensagem ||
-      "Guia não retornou PDF (verifique se já está paga ou indisponível).";
-    throw new Error(`SERPRO: ${msg}`);
-  }
-
-  return { pdfBase64, codigoBarras, provedor: "serpro" };
+  const data = JSON.parse(txt);
+  tokenCache = {
+    accessToken: data.access_token,
+    jwtToken: data.jwt_token,
+    expiraEm: agora + (Number(data.expires_in) || 3600) * 1000,
+  };
+  return tokenCache;
 }
 
-async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-  const context = await browser.newContext({ acceptDownloads: true });
-  const page = await context.newPage();
-
-  try {
-    await page.goto("https://www8.receita.fazenda.gov.br/simplesnacional/aplicacoes/atspo/pgmei.app/identificacao", {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
-
-    const temCaptcha = (await page.$(".h-captcha, iframe[src*='hcaptcha']")) !== null;
-    if (temCaptcha) {
-      throw new Error("A Receita pediu verificação humana. Use o botão 'Gerar guia oficial'.");
-    }
-
-    await page.fill("#cnpj", cnpj.replace(/\D/g, ""));
-    await page.click("button[type='submit'], #btnContinuar");
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
-
-    const linkGerar = await page.$("a[href*='gerar'], a:has-text('Emitir Guia')");
-    if (!linkGerar) {
-      throw new Error("Não foi possível acessar a tela de emissão do DAS.");
-    }
-    await linkGerar.click();
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
-
-    await page.selectOption("select#ano, select[name*='ano']", String(ano));
-    await page.click("button:has-text('OK'), button[type='submit']");
-    await page.waitForTimeout(2000);
-
-    const linhaMes = await page.$(`tr:has-text('${String(mes).padStart(2, "0")}/${ano}')`);
-    if (!linhaMes) {
-      throw new Error(`Competência ${mes}/${ano} não encontrada.`);
-    }
-
-    const checkbox = await linhaMes.$("input[type='checkbox']");
-    if (checkbox) await checkbox.check();
-
-    const [download] = await Promise.all([
-      page.waitForEvent("download", { timeout: 20000 }),
-      page.click("button:has-text('Gerar DAS'), button:has-text('Emitir')"),
-    ]);
-
-    const stream = await download.createReadStream();
-    const chunks = [];
-    for await (const chunk of stream) chunks.push(chunk);
-    const pdfBuffer = Buffer.concat(chunks);
-
-    return {
-      pdfBase64: pdfBuffer.toString("base64"),
-      codigoBarras: null,
-      provedor: "playwright",
-    };
-  } finally {
-    await browser.close().catch(() => {});
-  }
-}
-
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(
-      JSON.stringify({
-        ok: true,
-        status: "online",
-        serproAtivo: Boolean(SERPRO_KEY && serproHttpsAgent),
-      })
-    );
-  }
-
-  if (req.method === "POST" && url.pathname === "/emitir") {
-    const authHeader = req.headers["authorization"] || "";
-    const tokenEnviado = authHeader.replace(/^Bearer\s+/i, "");
-    if (tokenEnviado !== AUTH_TOKEN) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: false, erro: "Não autorizado" }));
-    }
-
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", async () => {
-      try {
-        const { cnpj, ano, mes } = JSON.parse(body || "{}");
-        if (!cnpj || !ano || !mes) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ ok: false, erro: "CNPJ, ano e mês são obrigatórios" }));
-        }
-
-        console.log(`[emitir] Iniciando emissão DAS para CNPJ ${cnpj}, competência ${mes}/${ano}...`);
-
-        let resultado = null;
-        if (SERPRO_KEY && serproHttpsAgent) {
-          try {
-            console.log("[emitir] Tentando emissão via SERPRO Integra Contador...");
-            resultado = await emitirDasViaSerpro({ cnpj, ano, mes });
-            console.log("[emitir] Sucesso via SERPRO!");
-          } catch (serproErr) {
-            console.warn("[emitir] SERPRO falhou, tentando fallback navegador:", serproErr.message);
-          }
-        }
-
-        if (!resultado) {
-          resultado = await emitirDasViaPlaywright({ cnpj, ano, mes });
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, ...resultado }));
-      } catch (err) {
-        console.error("[emitir] Erro geral:", err.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, erro: err.message }));
-      }
-    });
-    return;
-  }
-
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ erro: "Não encontrado" }));
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Robô DAS rodando na porta ${PORT} (0.0.0.0)`);
-  console.log(`SERPRO Integra Contador: ${SERPRO_KEY && serproHttpsAgent ? "HABILITADO" : "NÃO CONFIGURADO"}`);
-});
+async function emitirDasViaSerpro({ cnpj, ano,
