@@ -100,9 +100,9 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
   const mesFormatado = String(mes).padStart(2, "0");
   const periodoApuracao = `${ano}${mesFormatado}`;
 
-  const payload = JSON.stringify({
+  const envelope = {
     contratante: { numero: cnpjContratante, tipo: 2 },
-    autorTransmissao: { numero: cnpjContratante, tipo: 2 },
+    autorPedidoDados: { numero: cnpjContratante, tipo: 2 },
     contribuinte: { numero: cnpjContribuinte, tipo: 2 },
     pedidoDados: {
       idSistema: "PGMEI",
@@ -112,10 +112,13 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
         periodoApuracao,
       }),
     },
-  });
+  };
 
-  const resposta = await requestHttpsComAgente(
-    "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar",
+  const payload = JSON.stringify(envelope);
+
+  // Tenta endpoint /Emitir (padrão de serviços GERAR...), e caso necessário /Consultar
+  let resposta = await requestHttpsComAgente(
+    "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Emitir",
     {
       method: "POST",
       headers: {
@@ -128,36 +131,58 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
     payload
   );
 
-  if (resposta.status < 200 || resposta.status >= 300) {
-    const txt = resposta.body.toString("utf8");
-    throw new Error(`SERPRO retornou HTTP ${resposta.status}: ${txt.slice(0, 300)}`);
+  if (resposta.status === 404 || resposta.status === 405) {
+    resposta = await requestHttpsComAgente(
+      "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      },
+      payload
+    );
   }
 
-  const json = JSON.parse(resposta.body.toString("utf8"));
-  let dadosRetorno = json?.respostaDados?.dados;
+  const rawTxt = resposta.body.toString("utf8");
+  console.log(`[serpro] HTTP ${resposta.status}:`, rawTxt.slice(0, 500));
+
+  if (resposta.status < 200 || resposta.status >= 300) {
+    throw new Error(`SERPRO HTTP ${resposta.status}: ${rawTxt.slice(0, 300)}`);
+  }
+
+  const json = JSON.parse(rawTxt);
+  let dadosRetorno = json?.respostaDados?.dados || json?.dados;
   if (typeof dadosRetorno === "string") {
     try {
       dadosRetorno = JSON.parse(dadosRetorno);
-    } catch {
-      // mantém como string
-    }
+    } catch {}
   }
 
   const pdfBase64 =
     dadosRetorno?.pdf ||
     dadosRetorno?.documentoPdf ||
     dadosRetorno?.arquivoPdf ||
+    (Array.isArray(dadosRetorno) && dadosRetorno[0]?.pdf) ||
     json?.pdf;
 
   const codigoBarras =
     dadosRetorno?.codigoBarras ||
     dadosRetorno?.linhaDigitavel ||
     dadosRetorno?.numeroCodigoBarras ||
+    (Array.isArray(dadosRetorno) && dadosRetorno[0]?.codigoBarras) ||
     null;
 
   if (!pdfBase64) {
-    const msg = dadosRetorno?.mensagens?.[0]?.texto || dadosRetorno?.mensagem || JSON.stringify(dadosRetorno).slice(0, 200);
-    throw new Error(`SERPRO não retornou o PDF: ${msg}`);
+    const msg =
+      json?.mensagens?.map((m) => m.texto).join("; ") ||
+      dadosRetorno?.mensagens?.[0]?.texto ||
+      dadosRetorno?.mensagem ||
+      "Guia não retornou PDF (verifique se já está paga ou indisponível).";
+    throw new Error(`SERPRO: ${msg}`);
   }
 
   return { pdfBase64, codigoBarras, provedor: "serpro" };
