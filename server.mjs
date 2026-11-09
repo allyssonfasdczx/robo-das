@@ -70,7 +70,6 @@ async function obterTokenSerpro() {
   const basic = Buffer.from(`${SERPRO_KEY}:${SERPRO_SECRET}`).toString("base64");
   const corpo = "grant_type=client_credentials";
 
-  // Autenticação oficial mTLS SERPRO Integra Contador (gera access_token e jwt_token)
   const res = await requestHttpsComAgente(
     "https://autenticacao.sapi.serpro.gov.br/authenticate",
     {
@@ -100,4 +99,154 @@ async function obterTokenSerpro() {
   return tokenCache;
 }
 
-async function emitirDasViaSerpro({ cnpj, ano,
+async function emitirDasViaSerpro({ cnpj, ano, mes }) {
+  if (!SERPRO_KEY || !serproHttpsAgent) {
+    return null;
+  }
+  const { accessToken, jwtToken } = await obterTokenSerpro();
+  const cnpjContribuinte = String(cnpj).replace(/\D/g, "");
+  const cnpjContratante = SERPRO_CNPJ || cnpjContribuinte;
+  const mesFormatado = String(mes).padStart(2, "0");
+  const periodoApuracao = `${ano}${mesFormatado}`;
+
+  const envelope = {
+    contratante: { numero: cnpjContratante, tipo: 2 },
+    autorPedidoDados: { numero: cnpjContratante, tipo: 2 },
+    contribuinte: { numero: cnpjContribuinte, tipo: 2 },
+    pedidoDados: {
+      idSistema: "PGMEI",
+      idServico: "GERARDASPDF21",
+      versaoSistema: "1.0",
+      dados: JSON.stringify({
+        periodoApuracao,
+      }),
+    },
+  };
+
+  const payload = JSON.stringify(envelope);
+
+  // Envia variações de header aceitas pelas diferentes versões do Gateway SERPRO
+  const headersSerpro = {
+    Authorization: `Bearer ${accessToken}`,
+    jwt_token: jwtToken,
+    "jwt-token": jwtToken,
+    "Role-Type": "TERCEIROS",
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+  };
+
+  let resposta = await requestHttpsComAgente(
+    "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Emitir",
+    { method: "POST", headers: headersSerpro },
+    payload
+  );
+
+  if (resposta.status === 404 || resposta.status === 405) {
+    resposta = await requestHttpsComAgente(
+      "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar",
+      { method: "POST", headers: headersSerpro },
+      payload
+    );
+  }
+
+  const rawTxt = resposta.body.toString("utf8");
+  console.log(`[serpro status]: HTTP ${resposta.status}`);
+  try {
+    const parsed = JSON.parse(rawTxt);
+    console.log("[serpro resposta]:", JSON.stringify(parsed.mensagens || parsed, null, 2));
+  } catch {
+    console.log("[serpro raw]:", rawTxt);
+  }
+
+  if (resposta.status < 200 || resposta.status >= 300) {
+    throw new Error(`SERPRO HTTP ${resposta.status}: ${rawTxt.slice(0, 300)}`);
+  }
+
+  const json = JSON.parse(rawTxt);
+  let dadosRetorno = json?.respostaDados?.dados || json?.dados;
+  if (typeof dadosRetorno === "string") {
+    try {
+      dadosRetorno = JSON.parse(dadosRetorno);
+    } catch {}
+  }
+
+  const dasItem = Array.isArray(dadosRetorno) ? dadosRetorno[0] : dadosRetorno;
+  const pdfBase64 =
+    dasItem?.pdf ||
+    dasItem?.documentoPdf ||
+    dasItem?.arquivoPdf ||
+    json?.pdf;
+
+  const detalhamento = Array.isArray(dasItem?.detalhamento) ? dasItem.detalhamento[0] : dasItem?.detalhamento;
+  const codigoBarras =
+    dasItem?.codigoBarras ||
+    detalhamento?.codigoDeBarras ||
+    dasItem?.linhaDigitavel ||
+    null;
+
+  const valor = detalhamento?.valores?.total || dasItem?.valorTotal || null;
+
+  if (!pdfBase64) {
+    const msg =
+      json?.mensagens?.map((m) => m.texto).join("; ") ||
+      dasItem?.mensagens?.[0]?.texto ||
+      dasItem?.mensagem ||
+      "Guia não retornou PDF.";
+    throw new Error(`SERPRO: ${msg}`);
+  }
+
+  return { pdfBase64, codigoBarras, valor, provedor: "serpro" };
+}
+
+async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  });
+  const context = await browser.newContext({ acceptDownloads: true });
+  const page = await context.newPage();
+
+  try {
+    await page.goto("https://www8.receita.fazenda.gov.br/simplesnacional/aplicacoes/atspo/pgmei.app/identificacao", {
+      waitUntil: "networkidle",
+      timeout: 30000,
+    });
+
+    const temCaptcha = (await page.$(".h-captcha, iframe[src*='hcaptcha']")) !== null;
+    if (temCaptcha) {
+      throw new Error("A Receita pediu verificação humana. Use o botão 'Gerar guia oficial'.");
+    }
+
+    await page.fill("#cnpj", cnpj.replace(/\D/g, ""));
+    await page.click("button[type='submit'], #btnContinuar");
+    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
+
+    const linkGerar = await page.$("a[href*='gerar'], a:has-text('Emitir Guia')");
+    if (!linkGerar) {
+      throw new Error("Não foi possível acessar a tela de emissão do DAS.");
+    }
+    await linkGerar.click();
+    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
+
+    await page.selectOption("select#ano, select[name*='ano']", String(ano));
+    await page.click("button:has-text('OK'), button[type='submit']");
+    await page.waitForTimeout(2000);
+
+    const linhaMes = await page.$(`tr:has-text('${String(mes).padStart(2, "0")}/${ano}')`);
+    if (!linhaMes) {
+      throw new Error(`Competência ${mes}/${ano} não encontrada.`);
+    }
+
+    const checkbox = await linhaMes.$("input[type='checkbox']");
+    if (checkbox) await checkbox.check();
+
+    const [download] = await Promise.all([
+      page.waitForEvent("download", { timeout: 20000 }),
+      page.click("button:has-text('Gerar DAS'), button:has-text('Emitir')"),
+    ]);
+
+    const stream = await download.createReadStream();
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const pdfBuffer = Buffer.
