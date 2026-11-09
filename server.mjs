@@ -2,7 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import { chromium } from "playwright";
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8080;
 const AUTH_TOKEN = process.env.ROBO_DAS_TOKEN;
 if (!AUTH_TOKEN) {
   console.error("ERRO: defina a variável ROBO_DAS_TOKEN!");
@@ -25,7 +25,7 @@ if (SERPRO_CERT_B64) {
       rejectUnauthorized: true,
       keepAlive: true,
     });
-    console.log("[serpro] Agente mTLS com certificado e-CNPJ configurado.");
+    console.log("[serpro] Agente mTLS com certificado e-CNPJ configurado com sucesso.");
   } catch (err) {
     console.error("[serpro] Falha ao carregar certificado mTLS:", err.message);
   }
@@ -67,7 +67,7 @@ async function obterTokenSerpro() {
     return tokenCache;
   }
 
-  const basic = Buffer.from(`${SERPRO_KEY}:${SERPRO_SECRET}`).toString("base64");
+  const basic = Buffer.from(SERPRO_KEY + ":" + SERPRO_SECRET).toString("base64");
   const corpo = "grant_type=client_credentials";
 
   const res = await requestHttpsComAgente(
@@ -75,7 +75,7 @@ async function obterTokenSerpro() {
     {
       method: "POST",
       headers: {
-        Authorization: `Basic ${basic}`,
+        Authorization: "Basic " + basic,
         "Role-Type": "TERCEIROS",
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": Buffer.byteLength(corpo),
@@ -87,7 +87,7 @@ async function obterTokenSerpro() {
   const txt = res.body.toString("utf8");
   if (res.status !== 200) {
     console.error("[serpro auth]", res.status, txt);
-    throw new Error(`Falha autenticação SERPRO (${res.status}): ${txt.slice(0, 300)}`);
+    throw new Error("Falha autenticação SERPRO (" + res.status + "): " + txt.slice(0, 300));
   }
 
   const data = JSON.parse(txt);
@@ -107,7 +107,7 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
   const cnpjContribuinte = String(cnpj).replace(/\D/g, "");
   const cnpjContratante = SERPRO_CNPJ || cnpjContribuinte;
   const mesFormatado = String(mes).padStart(2, "0");
-  const periodoApuracao = `${ano}${mesFormatado}`;
+  const periodoApuracao = ano + mesFormatado;
 
   const envelope = {
     contratante: { numero: cnpjContratante, tipo: 2 },
@@ -125,9 +125,8 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
 
   const payload = JSON.stringify(envelope);
 
-  // Envia variações de header aceitas pelas diferentes versões do Gateway SERPRO
   const headersSerpro = {
-    Authorization: `Bearer ${accessToken}`,
+    Authorization: "Bearer " + accessToken,
     jwt_token: jwtToken,
     "jwt-token": jwtToken,
     "Role-Type": "TERCEIROS",
@@ -151,7 +150,7 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
   }
 
   const rawTxt = resposta.body.toString("utf8");
-  console.log(`[serpro status]: HTTP ${resposta.status}`);
+  console.log("[serpro status]: HTTP " + resposta.status);
   try {
     const parsed = JSON.parse(rawTxt);
     console.log("[serpro resposta]:", JSON.stringify(parsed.mensagens || parsed, null, 2));
@@ -160,7 +159,7 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
   }
 
   if (resposta.status < 200 || resposta.status >= 300) {
-    throw new Error(`SERPRO HTTP ${resposta.status}: ${rawTxt.slice(0, 300)}`);
+    throw new Error("SERPRO HTTP " + resposta.status + ": " + rawTxt.slice(0, 300));
   }
 
   const json = JSON.parse(rawTxt);
@@ -193,10 +192,15 @@ async function emitirDasViaSerpro({ cnpj, ano, mes }) {
       dasItem?.mensagens?.[0]?.texto ||
       dasItem?.mensagem ||
       "Guia não retornou PDF.";
-    throw new Error(`SERPRO: ${msg}`);
+    throw new Error("SERPRO: " + msg);
   }
 
-  return { pdfBase64, codigoBarras, valor, provedor: "serpro" };
+  return {
+    pdf_base64: pdfBase64,
+    codigo_barras: codigoBarras,
+    valor,
+    fonte: "serpro"
+  };
 }
 
 async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
@@ -233,9 +237,9 @@ async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
     await page.click("button:has-text('OK'), button[type='submit']");
     await page.waitForTimeout(2000);
 
-    const linhaMes = await page.$(`tr:has-text('${String(mes).padStart(2, "0")}/${ano}')`);
+    const linhaMes = await page.$("tr:has-text('" + String(mes).padStart(2, "0") + "/" + ano + "')");
     if (!linhaMes) {
-      throw new Error(`Competência ${mes}/${ano} não encontrada.`);
+      throw new Error("Competência " + mes + "/" + ano + " não encontrada.");
     }
 
     const checkbox = await linhaMes.$("input[type='checkbox']");
@@ -249,4 +253,79 @@ async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
     const stream = await download.createReadStream();
     const chunks = [];
     for await (const chunk of stream) chunks.push(chunk);
-    const pdfBuffer = Buffer.
+    const pdfBuffer = Buffer.concat(chunks);
+    const codigoBarras = pdfBuffer.toString("latin1").match(/\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d/)?.[0];
+
+    return {
+      pdf_base64: pdfBuffer.toString("base64"),
+      codigo_barras: codigoBarras,
+      valor: undefined,
+      fonte: "pgmei",
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  const send = (status, data) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(data));
+  };
+
+  if (req.method === "GET" && req.url === "/health") {
+    return send(200, {
+      ok: true,
+      status: "online",
+      serproAtivo: Boolean(SERPRO_KEY && SERPRO_CERT_B64),
+    });
+  }
+
+  if (req.method !== "POST" || req.url !== "/emitir") {
+    return send(404, { ok: false, erro: "Rota não encontrada" });
+  }
+
+  if (AUTH_TOKEN) {
+    const auth = req.headers["authorization"] || "";
+    if (auth !== "Bearer " + AUTH_TOKEN) {
+      return send(401, { ok: false, erro: "Token inválido" });
+    }
+  }
+
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", async () => {
+    try {
+      const { cnpj, ano, mes } = JSON.parse(body || "{}");
+      if (!cnpj || !ano || !mes) {
+        return send(400, { ok: false, erro: "Parâmetros obrigatórios: cnpj, ano, mes" });
+      }
+
+      console.log("[emitir] Solicitado DAS para CNPJ " + cnpj + " - " + mes + "/" + ano);
+
+      if (SERPRO_KEY && SERPRO_CERT_B64) {
+        try {
+          console.log("[emitir] Tentando via SERPRO Integra Contador...");
+          const resultadoSerpro = await emitirDasViaSerpro({ cnpj, ano, mes });
+          if (resultadoSerpro?.pdf_base64) {
+            console.log("[emitir] Sucesso via SERPRO!");
+            return send(200, { ok: true, ...resultadoSerpro });
+          }
+        } catch (errSerpro) {
+          console.error("[emitir] Falha no SERPRO:", errSerpro.message);
+          console.log("[emitir] Tentando fallback via navegador...");
+        }
+      }
+
+      const resultadoNavegador = await emitirDasViaPlaywright({ cnpj, ano, mes });
+      return send(200, { ok: true, ...resultadoNavegador });
+    } catch (err) {
+      console.error("[emitir] Erro final:", err.message);
+      return send(500, { ok: false, erro: err.message });
+    }
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("Robô do DAS rodando em 0.0.0.0:" + PORT);
+});
