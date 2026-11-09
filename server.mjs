@@ -1,331 +1,182 @@
+// Robô do DAS-MEI — roda FORA do app (Railway/Render/VPS com Node 20 + Playwright).
+// 1º caminho: API oficial SERPRO Integra Contador (PGMEI GERARDASPDF21) — sem CAPTCHA.
+//    Exige mTLS com o e-CNPJ da Otmizee, por isso fica aqui (o app na borda não faz mTLS).
+//    Variáveis: SERPRO_CONSUMER_KEY, SERPRO_CONSUMER_SECRET, SERPRO_CNPJ (contratante),
+//    SERPRO_CERT_BASE64 (arquivo .pfx em base64), SERPRO_CERT_SENHA.
+// 2º caminho (fallback): navegador no PGMEI. Não contorna CAPTCHA.
+// Também: ROBO_DAS_TOKEN (mesmo valor salvo no OtmizeeMEI), PORT.
 import http from "node:http";
 import https from "node:https";
 import { chromium } from "playwright";
+import jsQR from "jsqr";
+import jpeg from "jpeg-js";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
-const PORT = Number(process.env.PORT) || 8080;
-const AUTH_TOKEN = process.env.ROBO_DAS_TOKEN;
-if (!AUTH_TOKEN) {
-  console.error("ERRO: defina a variável ROBO_DAS_TOKEN!");
-  process.exit(1);
-}
-
-const SERPRO_KEY = process.env.SERPRO_CONSUMER_KEY;
-const SERPRO_SECRET = process.env.SERPRO_CONSUMER_SECRET;
-const SERPRO_CNPJ = (process.env.SERPRO_CNPJ || "").replace(/\D/g, "");
-const SERPRO_CERT_B64 = process.env.SERPRO_CERT_BASE64;
-const SERPRO_CERT_PASS = process.env.SERPRO_CERT_SENHA;
-
-let serproHttpsAgent = null;
-if (SERPRO_CERT_B64) {
+// Lê a linha digitável (texto da guia) e o PIX copia-e-cola (QR Code em JPEG dentro do PDF).
+async function lerGuia(buf) {
+  let linha, pix;
   try {
-    const pfxBuffer = Buffer.from(SERPRO_CERT_B64, "base64");
-    serproHttpsAgent = new https.Agent({
-      pfx: pfxBuffer,
-      passphrase: SERPRO_CERT_PASS || "",
-      rejectUnauthorized: true,
-      keepAlive: true,
-    });
-    console.log("[serpro] Agente mTLS com certificado e-CNPJ configurado com sucesso.");
-  } catch (err) {
-    console.error("[serpro] Falha ao carregar certificado mTLS:", err.message);
-  }
+    const doc = await getDocument({ data: new Uint8Array(buf), disableFontFace: true, verbosity: 0 }).promise;
+    const tc = await (await doc.getPage(1)).getTextContent();
+    const txt = tc.items.map((i) => i.str).join(" ").replace(/\s+/g, " ");
+    linha = txt.match(/8\d{10} ?\d ?\d{11} ?\d ?\d{11} ?\d ?\d{11} ?\d/)?.[0];
+  } catch (e) { console.error("linha", e.message); }
+  try {
+    const s = buf.toString("latin1");
+    let i = 0;
+    while (!pix && (i = s.indexOf("\xFF\xD8\xFF", i)) !== -1) {
+      const e = s.indexOf("\xFF\xD9", i);
+      if (e === -1) break;
+      const img = jpeg.decode(buf.subarray(i, e + 2), { useTArray: true, formatAsRGBA: true });
+      const q = jsQR(img.data, img.width, img.height);
+      if (q?.data?.startsWith("000201")) pix = q.data;
+      i = e;
+    }
+  } catch (e) { console.error("pix", e.message); }
+  return { linha, pix };
 }
 
-function requestHttpsComAgente(urlStr, options, bodyData) {
+const TOKEN = process.env.ROBO_DAS_TOKEN;
+const PGMEI = "https://www8.receita.fazenda.gov.br/SimplesNacional/Aplicacoes/ATSPO/pgmei.app/Identificacao";
+if (!TOKEN) throw new Error("Defina ROBO_DAS_TOKEN");
+
+// ---------------- SERPRO Integra Contador ----------------
+const S = {
+  key: process.env.SERPRO_CONSUMER_KEY,
+  secret: process.env.SERPRO_CONSUMER_SECRET,
+  cnpj: (process.env.SERPRO_CNPJ || "").replace(/\D/g, ""),
+  pfx: process.env.SERPRO_CERT_BASE64,
+  senha: process.env.SERPRO_CERT_SENHA,
+};
+const serproAtivo = () => !!(S.key && S.secret && S.cnpj.length === 14 && S.pfx);
+let agent;
+const getAgent = () => (agent ??= new https.Agent({ pfx: Buffer.from(S.pfx, "base64"), passphrase: S.senha, keepAlive: true }));
+
+function req(url, { method = "POST", headers = {}, body, mtls = false } = {}) {
   return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const req = https.request(
-      url,
-      {
-        ...options,
-        agent: serproHttpsAgent,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          const buf = Buffer.concat(chunks);
-          resolve({ status: res.statusCode, headers: res.headers, body: buf });
-        });
-      }
-    );
-    req.on("error", reject);
-    req.on("timeout", () => req.destroy(new Error("Timeout na requisição SERPRO")));
-    if (bodyData) req.write(bodyData);
-    req.end();
+    const r = https.request(url, { method, headers, agent: mtls ? getAgent() : undefined, timeout: 60000 }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => resolve({ status: res.statusCode, text: d }));
+    });
+    r.on("error", reject);
+    r.on("timeout", () => r.destroy(new Error("timeout")));
+    if (body) r.write(body);
+    r.end();
   });
 }
 
-let tokenCache = null;
-
-async function obterTokenSerpro() {
-  if (!SERPRO_KEY || !SERPRO_SECRET || !serproHttpsAgent) {
-    throw new Error("Credenciais ou certificado mTLS do SERPRO não configurados.");
-  }
-  const agora = Date.now();
-  if (tokenCache && tokenCache.expiraEm > agora + 60_000) {
-    return tokenCache;
-  }
-
-  const basic = Buffer.from(SERPRO_KEY + ":" + SERPRO_SECRET).toString("base64");
-  const corpo = "grant_type=client_credentials";
-
-  const res = await requestHttpsComAgente(
-    "https://autenticacao.sapi.serpro.gov.br/authenticate",
-    {
-      method: "POST",
-      headers: {
-        Authorization: "Basic " + basic,
-        "Role-Type": "TERCEIROS",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Content-Length": Buffer.byteLength(corpo),
-      },
+let tokenCache = null; // { access, jwt, exp }
+async function serproToken() {
+  if (tokenCache && tokenCache.exp > Date.now() + 60000) return tokenCache;
+  const r = await req("https://autenticacao.sapi.serpro.gov.br/authenticate", {
+    mtls: true,
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${S.key}:${S.secret}`).toString("base64"),
+      "Role-Type": "TERCEIROS",
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-    corpo
-  );
-
-  const txt = res.body.toString("utf8");
-  if (res.status !== 200) {
-    console.error("[serpro auth]", res.status, txt);
-    throw new Error("Falha autenticação SERPRO (" + res.status + "): " + txt.slice(0, 300));
-  }
-
-  const data = JSON.parse(txt);
-  tokenCache = {
-    accessToken: data.access_token,
-    jwtToken: data.jwt_token,
-    expiraEm: agora + (Number(data.expires_in) || 3600) * 1000,
-  };
+    body: "grant_type=client_credentials",
+  });
+  if (r.status !== 200) throw new Error(`SERPRO auth ${r.status}: ${r.text.slice(0, 300)}`);
+  const j = JSON.parse(r.text);
+  tokenCache = { access: j.access_token, jwt: j.jwt_token, exp: Date.now() + (Number(j.expires_in) || 2000) * 1000 };
   return tokenCache;
 }
 
-async function emitirDasViaSerpro({ cnpj, ano, mes }) {
-  if (!SERPRO_KEY || !serproHttpsAgent) {
-    return null;
+async function emitirSerpro({ cnpj, ano, mes }) {
+  const t = await serproToken();
+  const body = JSON.stringify({
+    contratante: { numero: S.cnpj, tipo: 2 },
+    autorPedidoDados: { numero: S.cnpj, tipo: 2 },
+    contribuinte: { numero: cnpj, tipo: 2 },
+    pedidoDados: { idSistema: "PGMEI", idServico: "GERARDASPDF21", versaoSistema: "1.0", dados: JSON.stringify({ periodoApuracao: `${ano}${mes}` }) },
+  });
+  const r = await req("https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Emitir", {
+    headers: { Authorization: `Bearer ${t.access}`, jwt_token: t.jwt, "Content-Type": "application/json", accept: "application/json" },
+    body,
+  });
+  let j = {};
+  try { j = JSON.parse(r.text); } catch {}
+  if (r.status !== 200) {
+    const msg = (j.mensagens || []).map((m) => m.texto).join("; ");
+    console.error("SERPRO emitir", r.status, r.text.slice(0, 500));
+    return { ok: false, erro: msg || "A Receita não gerou a guia agora. Tente novamente.", definitivo: r.status < 500 };
   }
-  const { accessToken, jwtToken } = await obterTokenSerpro();
-  const cnpjContribuinte = String(cnpj).replace(/\D/g, "");
-  const cnpjContratante = SERPRO_CNPJ || cnpjContribuinte;
-  const mesFormatado = String(mes).padStart(2, "0");
-  const periodoApuracao = ano + mesFormatado;
-
-  const envelope = {
-    contratante: { numero: cnpjContratante, tipo: 2 },
-    autorPedidoDados: { numero: cnpjContratante, tipo: 2 },
-    contribuinte: { numero: cnpjContribuinte, tipo: 2 },
-    pedidoDados: {
-      idSistema: "PGMEI",
-      idServico: "GERARDASPDF21",
-      versaoSistema: "1.0",
-      dados: JSON.stringify({
-        periodoApuracao,
-      }),
-    },
-  };
-
-  const payload = JSON.stringify(envelope);
-
-  const headersSerpro = {
-    Authorization: "Bearer " + accessToken,
-    jwt_token: jwtToken,
-    "jwt-token": jwtToken,
-    "Role-Type": "TERCEIROS",
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    "Content-Length": Buffer.byteLength(payload),
-  };
-
-  let resposta = await requestHttpsComAgente(
-    "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Emitir",
-    { method: "POST", headers: headersSerpro },
-    payload
-  );
-
-  if (resposta.status === 404 || resposta.status === 405) {
-    resposta = await requestHttpsComAgente(
-      "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar",
-      { method: "POST", headers: headersSerpro },
-      payload
-    );
-  }
-
-  const rawTxt = resposta.body.toString("utf8");
-  console.log("[serpro status]: HTTP " + resposta.status);
-  try {
-    const parsed = JSON.parse(rawTxt);
-    console.log("[serpro resposta]:", JSON.stringify(parsed.mensagens || parsed, null, 2));
-  } catch {
-    console.log("[serpro raw]:", rawTxt);
-  }
-
-  if (resposta.status < 200 || resposta.status >= 300) {
-    throw new Error("SERPRO HTTP " + resposta.status + ": " + rawTxt.slice(0, 300));
-  }
-
-  const json = JSON.parse(rawTxt);
-  let dadosRetorno = json?.respostaDados?.dados || json?.dados;
-  if (typeof dadosRetorno === "string") {
-    try {
-      dadosRetorno = JSON.parse(dadosRetorno);
-    } catch {}
-  }
-
-  const dasItem = Array.isArray(dadosRetorno) ? dadosRetorno[0] : dadosRetorno;
-  const pdfBase64 =
-    dasItem?.pdf ||
-    dasItem?.documentoPdf ||
-    dasItem?.arquivoPdf ||
-    json?.pdf;
-
-  const detalhamento = Array.isArray(dasItem?.detalhamento) ? dasItem.detalhamento[0] : dasItem?.detalhamento;
-  const codigoBarras =
-    dasItem?.codigoBarras ||
-    detalhamento?.codigoDeBarras ||
-    dasItem?.linhaDigitavel ||
-    null;
-
-  const valor = detalhamento?.valores?.total || dasItem?.valorTotal || null;
-
-  if (!pdfBase64) {
-    const msg =
-      json?.mensagens?.map((m) => m.texto).join("; ") ||
-      dasItem?.mensagens?.[0]?.texto ||
-      dasItem?.mensagem ||
-      "Guia não retornou PDF.";
-    throw new Error("SERPRO: " + msg);
-  }
-
-  return {
-    pdf_base64: pdfBase64,
-    codigo_barras: codigoBarras,
-    valor,
-    fonte: "serpro"
-  };
+  const das = (typeof j.dados === "string" ? JSON.parse(j.dados) : j.dados)?.[0] ?? {};
+  const det = Array.isArray(das.detalhamento) ? das.detalhamento[0] : das.detalhamento ?? {};
+  const codigo = Array.isArray(det.codigoDeBarras) ? det.codigoDeBarras.join(" ") : det.codigoDeBarras;
+  if (!das.pdf) return { ok: false, erro: "Esta competência não está disponível (pode já estar paga).", definitivo: true };
+  const lido = await lerGuia(Buffer.from(das.pdf, "base64"));
+  return { ok: true, fonte: "serpro", pdf_base64: das.pdf, codigo_barras: codigo || lido.linha, pix: lido.pix, valor: det.valores?.total };
 }
 
-async function emitirDasViaPlaywright({ cnpj, ano, mes }) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-  const context = await browser.newContext({ acceptDownloads: true });
-  const page = await context.newPage();
+// ---------------- Fallback: navegador no PGMEI ----------------
+let browser;
+const getBrowser = async () => (browser ??= await chromium.launch({ headless: true }));
 
+async function emitirNavegador({ cnpj, ano, mes }) {
+  const ctx = await (await getBrowser()).newContext({ acceptDownloads: true, locale: "pt-BR" });
+  const page = await ctx.newPage();
   try {
-    await page.goto("https://www8.receita.fazenda.gov.br/simplesnacional/aplicacoes/atspo/pgmei.app/identificacao", {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
-
-    const temCaptcha = (await page.$(".h-captcha, iframe[src*='hcaptcha']")) !== null;
-    if (temCaptcha) {
-      throw new Error("A Receita pediu verificação humana. Use o botão 'Gerar guia oficial'.");
-    }
-
-    await page.fill("#cnpj", cnpj.replace(/\D/g, ""));
-    await page.click("button[type='submit'], #btnContinuar");
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
-
-    const linkGerar = await page.$("a[href*='gerar'], a:has-text('Emitir Guia')");
-    if (!linkGerar) {
-      throw new Error("Não foi possível acessar a tela de emissão do DAS.");
-    }
-    await linkGerar.click();
-    await page.waitForNavigation({ waitUntil: "networkidle", timeout: 15000 });
-
-    await page.selectOption("select#ano, select[name*='ano']", String(ano));
-    await page.click("button:has-text('OK'), button[type='submit']");
-    await page.waitForTimeout(2000);
-
-    const linhaMes = await page.$("tr:has-text('" + String(mes).padStart(2, "0") + "/" + ano + "')");
-    if (!linhaMes) {
-      throw new Error("Competência " + mes + "/" + ano + " não encontrada.");
-    }
-
-    const checkbox = await linhaMes.$("input[type='checkbox']");
-    if (checkbox) await checkbox.check();
-
+    await page.goto(PGMEI, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await page.fill("#cnpj", cnpj);
+    await page.click("#continuar");
+    await page.waitForLoadState("networkidle", { timeout: 30000 });
+    if (await page.locator("iframe[src*='hcaptcha'], iframe[src*='recaptcha']").count())
+      return { ok: false, erro: "A Receita pediu verificação humana. Use o botão 'Gerar guia oficial'." };
+    if (!/emissao|Emissao/.test(page.url())) await page.click("a[href*='/emissao']");
+    await page.waitForSelector("select#anoCalendarioSelect, select[name='ano']", { timeout: 20000 });
+    await page.selectOption("select#anoCalendarioSelect, select[name='ano']", ano);
+    await page.click("button[type='submit']:has-text('Ok'), button:has-text('Ok')");
+    const box = page.locator(`input[type='checkbox'][value='${ano}${mes}']`);
+    if (!(await box.count())) return { ok: false, erro: "Esta competência não está disponível (pode já estar paga)." };
+    await box.check();
+    await page.click("#btnEmitirDas");
+    const valor = (await page.locator("text=/R\\$\\s*[\\d.,]+/").first().textContent().catch(() => null)) ?? undefined;
     const [download] = await Promise.all([
-      page.waitForEvent("download", { timeout: 20000 }),
-      page.click("button:has-text('Gerar DAS'), button:has-text('Emitir')"),
+      page.waitForEvent("download", { timeout: 30000 }),
+      page.click("a:has-text('Imprimir/Visualizar PDF'), a[href*='imprimir']"),
     ]);
-
-    const stream = await download.createReadStream();
     const chunks = [];
-    for await (const chunk of stream) chunks.push(chunk);
-    const pdfBuffer = Buffer.concat(chunks);
-    const codigoBarras = pdfBuffer.toString("latin1").match(/\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d/)?.[0];
-
-    return {
-      pdf_base64: pdfBuffer.toString("base64"),
-      codigo_barras: codigoBarras,
-      valor: undefined,
-      fonte: "pgmei",
-    };
+    for await (const c of await download.createReadStream()) chunks.push(c);
+    const pdf = Buffer.concat(chunks);
+    const codigo = pdf.toString("latin1").match(/\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d\s?\d{11}\s?\d/)?.[0];
+    const lido = await lerGuia(pdf);
+    return { ok: true, fonte: "pgmei", pdf_base64: pdf.toString("base64"), codigo_barras: lido.linha || codigo, pix: lido.pix, valor };
+  } catch (e) {
+    console.error(e);
+    return { ok: false, erro: "O site da Receita mudou ou está fora do ar. Tente mais tarde." };
   } finally {
-    await browser.close();
+    await ctx.close();
   }
 }
 
-const server = http.createServer(async (req, res) => {
-  const send = (status, data) => {
-    res.writeHead(status, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(data));
-  };
-
-  if (req.method === "GET" && req.url === "/health") {
-    return send(200, {
-      ok: true,
-      status: "online",
-      serproAtivo: Boolean(SERPRO_KEY && SERPRO_CERT_B64),
-    });
-  }
-
-  if (req.method !== "POST" || req.url !== "/emitir") {
-    return send(404, { ok: false, erro: "Rota não encontrada" });
-  }
-
-  if (AUTH_TOKEN) {
-    const auth = req.headers["authorization"] || "";
-    if (auth !== "Bearer " + AUTH_TOKEN) {
-      return send(401, { ok: false, erro: "Token inválido" });
-    }
-  }
-
-  let body = "";
-  req.on("data", (chunk) => (body += chunk));
-  req.on("end", async () => {
+async function emitir(p) {
+  if (serproAtivo()) {
     try {
-      const { cnpj, ano, mes } = JSON.parse(body || "{}");
-      if (!cnpj || !ano || !mes) {
-        return send(400, { ok: false, erro: "Parâmetros obrigatórios: cnpj, ano, mes" });
-      }
+      const r = await emitirSerpro(p);
+      if (r.ok || r.definitivo) return r;
+    } catch (e) { console.error("SERPRO", e.message); }
+  }
+  return emitirNavegador(p);
+}
 
-      console.log("[emitir] Solicitado DAS para CNPJ " + cnpj + " - " + mes + "/" + ano);
-
-      if (SERPRO_KEY && SERPRO_CERT_B64) {
-        try {
-          console.log("[emitir] Tentando via SERPRO Integra Contador...");
-          const resultadoSerpro = await emitirDasViaSerpro({ cnpj, ano, mes });
-          if (resultadoSerpro?.pdf_base64) {
-            console.log("[emitir] Sucesso via SERPRO!");
-            return send(200, { ok: true, ...resultadoSerpro });
-          }
-        } catch (errSerpro) {
-          console.error("[emitir] Falha no SERPRO:", errSerpro.message);
-          console.log("[emitir] Tentando fallback via navegador...");
-        }
-      }
-
-      const resultadoNavegador = await emitirDasViaPlaywright({ cnpj, ano, mes });
-      return send(200, { ok: true, ...resultadoNavegador });
-    } catch (err) {
-      console.error("[emitir] Erro final:", err.message);
-      return send(500, { ok: false, erro: err.message });
-    }
-  });
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("Robô do DAS rodando em 0.0.0.0:" + PORT);
-});
+const PORT = Number(process.env.PORT) || 3000;
+http.createServer(async (req, res) => {
+  const send = (s, b) => { res.writeHead(s, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+  try {
+    if (req.url === "/health") return send(200, { ok: true, status: "online", serpro: serproAtivo() });
+    if (req.method !== "POST" || req.url !== "/emitir") return send(404, { ok: false });
+    if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { ok: false, erro: "Não autorizado" });
+    let body = "";
+    for await (const c of req) body += c;
+    const { cnpj, ano, mes } = JSON.parse(body || "{}");
+    if (!/^\d{14}$/.test(cnpj ?? "") || !/^\d{4}$/.test(ano ?? "") || !/^\d{2}$/.test(mes ?? ""))
+      return send(400, { ok: false, erro: "Dados inválidos" });
+    send(200, await emitir({ cnpj, ano, mes }));
+  } catch (e) {
+    console.error(e);
+    send(500, { ok: false, erro: "Erro interno do robô." });
+  }
+}).listen(PORT, "0.0.0.0", () => console.log(`Robô do DAS ouvindo em 0.0.0.0:${PORT}`));
